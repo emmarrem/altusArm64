@@ -20,6 +20,18 @@ env:
   UPSTREAM: amanharwara/altus
 
 jobs:
+  refresh-schedule:
+    if: github.repository == 'emmarrem/altusArm64' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      # Refresh the schedule before GitHub's public-repository inactivity timeout.
+      - name: Keep the upstream check enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/windows-arm64-release.yml/enable"
+
   discover:
     if: github.repository == 'emmarrem/altusArm64' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
@@ -44,7 +56,7 @@ jobs:
           export ASSET="Altus-Setup-$version-arm64.exe"
 
           complete=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '
-            .[] | select(.tag_name == env.RELEASE_TAG and (.draft or .prerelease | not))
+            .[] | select(.tag_name == env.RELEASE_TAG and ((.draft or .prerelease) | not))
             | .assets[] | select(.name == env.ASSET and .state == "uploaded" and .size > 0) | .name
           ')
           if [[ -n "$complete" ]]; then
