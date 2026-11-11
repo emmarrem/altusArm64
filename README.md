@@ -4,6 +4,10 @@
 
 ## Installation
 
+### Windows ARM64
+
+Download `Altus-Setup-<version>-arm64.exe` from the [latest release of this fork](https://github.com/emmarrem/altusArm64/releases/latest) and run the installer. The release includes a SHA-256 checksum and links to the exact upstream source used for the build.
+
 ### Windows
 
 - Download the `.exe` file from the [latest release](https://github.com/amanharwara/altus/releases/latest)
