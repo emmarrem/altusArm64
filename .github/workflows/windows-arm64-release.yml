@@ -1,0 +1,163 @@
+name: Windows ARM64 release
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/windows-arm64-release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-arm64-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: amanharwara/altus
+
+jobs:
+  discover:
+    if: github.repository == 'emmarrem/altusArm64' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      upstream-tag: ${{ steps.release.outputs.upstream-tag }}
+      source: ${{ steps.release.outputs.source }}
+      needed: ${{ steps.release.outputs.needed }}
+    steps:
+      - name: Find the latest stable upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          upstream_tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          if [[ ! "$upstream_tag" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Unexpected stable upstream tag: $upstream_tag"
+            exit 1
+          fi
+          version=${BASH_REMATCH[1]}
+          export RELEASE_TAG="windows-arm64-$version"
+          export ASSET="Altus-Setup-$version-arm64.exe"
+
+          complete=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '
+            .[] | select(.tag_name == env.RELEASE_TAG and (.draft or .prerelease | not))
+            | .assets[] | select(.name == env.ASSET and .state == "uploaded" and .size > 0) | .name
+          ')
+          if [[ -n "$complete" ]]; then
+            echo "$RELEASE_TAG is already published with its installer."
+            exit 0
+          fi
+
+          source=$(gh api "repos/$UPSTREAM/commits/$upstream_tag" --jq .sha)
+          [[ "$source" =~ ^[0-9a-f]{40}$ ]]
+          {
+            echo "version=$version"
+            echo "upstream-tag=$upstream_tag"
+            echo "source=$source"
+            echo "needed=true"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.needed == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.discover.outputs.version }}
+    steps:
+      - name: Check out the released upstream source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: amanharwara/altus
+          ref: ${{ needs.discover.outputs.source }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Build the ARM64 installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $package = Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json
+          if ($package.version -ne $env:VERSION) {
+            throw "Upstream package version $($package.version) differs from release $env:VERSION."
+          }
+          corepack enable
+          yarn install --immutable
+          yarn make --platform=win32 --arch=arm64
+      - name: Verify the Windows executable and stage the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = Get-ChildItem -LiteralPath out -Directory -Filter '*-win32-arm64'
+          if (@($app).Count -ne 1) { throw 'Expected one unpacked ARM64 application.' }
+          $exe = Join-Path $app.FullName 'Altus.exe'
+          $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($exe))
+          try {
+            if ($reader.ReadUInt16() -ne 0x5A4D) { throw 'Missing DOS signature.' }
+            $reader.BaseStream.Position = 0x3c
+            $reader.BaseStream.Position = $reader.ReadInt32()
+            if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Missing PE signature.' }
+            $machine = $reader.ReadUInt16()
+            if ($machine -ne 0xAA64) { throw "Unexpected PE machine type: $machine." }
+            Write-Host 'Verified Altus.exe PE machine type 0xAA64 (ARM64).'
+          } finally {
+            $reader.Dispose()
+          }
+
+          $installer = @(Get-ChildItem -LiteralPath out/make -Recurse -File -Filter '*.exe')
+          if ($installer.Count -ne 1) { throw 'Expected exactly one Windows installer.' }
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          $asset = "Altus-Setup-$env:VERSION-arm64.exe"
+          Copy-Item -LiteralPath $installer[0].FullName -Destination "release-assets/$asset"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "release-assets/$asset").Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -Encoding ascii -LiteralPath "release-assets/$asset.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-arm64-${{ needs.discover.outputs.version }}
+          path: release-assets/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.discover.outputs.version }}
+      UPSTREAM_TAG: ${{ needs.discover.outputs.upstream-tag }}
+      SOURCE: ${{ needs.discover.outputs.source }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-arm64-${{ needs.discover.outputs.version }}
+      - name: Publish a stable GitHub release
+        run: |
+          tag="windows-arm64-$VERSION"
+          asset="Altus-Setup-$VERSION-arm64.exe"
+          sha256sum --check "$asset.sha256"
+
+          current=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$tag\") | .tag_name")
+          if [[ -z "$current" ]]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft \
+              --title "Altus $VERSION for Windows ARM64" --notes "$(cat <<EOF
+          Windows ARM64 installer for Altus $VERSION.
+
+          - [Upstream release](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG)
+          - [Exact source used for this build](https://github.com/$UPSTREAM/tree/$SOURCE)
+          EOF
+            )"
+          fi
+
+          gh release upload "$tag" "$asset" "$asset.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit "$tag" --draft=false --prerelease=false --latest --repo "$GITHUB_REPOSITORY"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url,isDraft,isPrerelease,assets \
+            --jq '{url, isDraft, isPrerelease, assets: [.assets[].name]}'
